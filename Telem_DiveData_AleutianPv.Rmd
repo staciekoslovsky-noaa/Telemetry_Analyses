@@ -1,0 +1,405 @@
+---
+title: 'Aleutian Harbor Seal: Dive Data Overview'
+author: "S. Hardy"
+date: "3/12/2020"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+
+# Functions
+`%notin%` <- Negate(`%in%`)
+sequence_by_hour <- function(start, end) {
+  start <- trunc(start, unit = "hours")
+  end <- trunc(end, unit = "hours")
+  dt <- seq(start, end, by = "hour")
+  starts <- pmax(start, as.POSIXct(dt, frac = 0))
+  ends <- starts + 59*60 + 59 
+  unique(data.frame(start = starts, end = ends))
+}
+
+# Load libraries
+library(RPostgres)
+library(tidyverse)
+library(sf)
+library(dplyr)
+library(lubridate)
+
+# Connect to DB and get starting data
+con <- RPostgres::dbConnect(Postgres(), 
+                              dbname = Sys.getenv("pep_db"), 
+                              host = Sys.getenv("pep_ip"), 
+                              port = Sys.getenv("pep_port"),
+                              user = Sys.getenv("pep_user"), 
+                              password = "$e@l")
+                                #rstudioapi::askForPassword(paste("Enter your DB password for user account: ", Sys.getenv("pep_user"), sep = "")))
+
+behav <- RPostgres::dbGetQuery(con, "SELECT b.*, sex, age_class FROM telem.tbl_wc_behav b INNER JOIN telem.tbl_deploy d ON b.deploy_id = d.id INNER JOIN capture.tbl_event e ON e.speno = SUBSTRING(b.deployid, 1, 11) LEFT JOIN capture.lku_sex USING (sex_lku) LEFT JOIN capture.lku_age_class USING (age_class_lku) WHERE (b.deployid LIKE \'PV2014%\' OR b.deployid LIKE \'PV2015%\' OR b.deployid LIKE \'PV2016%\') AND start_dt >= deploy_dt AND start_dt < d.end_dt")  %>%
+  mutate(life_history = paste(sex, age_class, sep = ": ")) %>%
+  mutate(minutes_msg = as.numeric((end_dt - start_dt)/60))
+
+RPostgres::dbDisconnect(con)
+rm(con)
+
+# List of deployIDs to use for detailed tag reviews
+deployids <- c("PV2014_2016_10A0586", "PV2015_1008_14A0822", "PV2015_1016_14A0808", "PV2016_3001_16A0227", "PV2016_3021_15A0891")
+
+# Calculate number of hours available for each tag deployment
+msg_tagtime <- behav %>%
+  filter(what == "Message") %>%
+  group_by(deployid, life_history) %>%
+  summarize(hrs_msg = sum(minutes_msg, na.rm = TRUE)/60)
+
+# Create list of deployments to exclude because there is too little data
+to_remove <- msg_tagtime %>%
+  filter(hrs_msg < 168)
+
+# Get message data from behav
+msg <- behav %>%
+  filter(what == "Message") %>%
+  filter(deployid %notin% to_remove$deployid)
+
+# Get dive and surfacing data from behav
+dive2sfc <- behav %>%
+  filter(what != "Message") %>%
+  filter(deployid %notin% to_remove$deployid) 
+
+# Get dive data from behav
+dive <- behav %>%
+  filter(what == "Dive") %>%
+  filter(deployid %notin% to_remove$deployid) %>%
+  filter(duration_max < 3600) %>%
+  mutate(start = as.POSIXct(trunc(start_dt, unit = "hours")))
+
+# Summarize available message data for join to all_times
+msg_times <- msg %>%
+  group_by(id) %>%
+  do(sequence_by_hour(.$start_dt, .$end_dt)) %>%
+  ungroup %>%
+  left_join(msg, by = "id") %>%
+  mutate(min_per_hour = ifelse(start_dt >= start & end_dt <= end, (end_dt - start_dt),
+                              ifelse(start_dt >= start & end_dt > end, (end - start_dt)/60,
+                                     ifelse(start_dt < start & end_dt <= end, (end_dt - start)/60, 60)))) %>%
+  group_by(deployid, start, end) %>%
+  summarize(min_per_hour = sum(min_per_hour, na.rm = TRUE)) %>%
+  mutate(min_per_hour= ifelse(min_per_hour > 60, 60, min_per_hour))
+
+# Summarize available dive shape data for join to all_times
+dive_summ_shape <- dive %>%
+  group_by(deployid, start, shape) %>% 
+  tally() %>%
+  spread(shape, n, fill = NA, convert = FALSE)
+
+# Summarize available dive depth data for join to all_times
+dive_summ_max_depth <- dive %>%
+  group_by(deployid, start) %>% 
+  slice(which.max(depth_max)) %>%
+  select("deployid", "start", "depth_max") %>%
+  ungroup()
+
+# Summarize available dive duration data for join to all_times
+dive_summ_max_duration <- dive %>%
+  group_by(deployid, start) %>% 
+  slice(which.max(duration_max)) %>%
+  select("deployid", "start", "duration_max") %>%
+  ungroup()
+
+# Calculate first and last hour by tag for use in creating list of all hours for which there could be data for each deployment
+min_times <- msg %>%
+  group_by(deployid) %>% 
+  slice(which.min(start_dt)) %>%
+  select("deployid", "start_dt")
+
+max_times <- msg %>%
+  group_by(deployid) %>% 
+  slice(which.max(end_dt)) %>%
+  select("deployid", "end_dt")
+
+# Create all_times dataset
+all_times <- left_join(min_times, max_times, by = "deployid") %>%
+  mutate(start_dt_round = as.POSIXct(trunc(start_dt, unit = "hours")),
+         end_dt_round = as.POSIXct(trunc(end_dt, unit = "hours"))) %>%
+  group_by(deployid) %>%
+  do(sequence_by_hour(.$start_dt_round, .$end_dt_round)) %>%
+  ungroup %>%
+  mutate(hour = as.integer(format(start,'%H'))) %>%
+  left_join(msg_tagtime, by = "deployid") %>%
+  left_join(msg_times, by = c('deployid', "start", "end")) %>%
+    mutate(min_per_hour = replace_na(min_per_hour, 0)) %>%
+    mutate(min_bin = floor(min_per_hour/10) * 10) %>%
+  left_join(dive_summ_shape, by = c('deployid', "start")) %>%
+    mutate(Square = ifelse(min_per_hour == 60 & is.na(Square), 0, Square)) %>%
+    mutate(U = ifelse(min_per_hour == 60 & is.na(U), 0, U)) %>%
+    mutate(V = ifelse(min_per_hour == 60 & is.na(V), 0, V)) %>%
+    mutate(dives_per_hour = select(., Square:V) %>% rowSums(na.rm = TRUE)) %>%
+  left_join(dive_summ_max_depth, by = c('deployid', "start")) %>%
+  left_join(dive_summ_max_duration, by = c('deployid', "start"))
+
+# Create dataset of target seals for figures
+sub_times <- all_times %>%
+  filter(deployid %in% deployids)
+
+sub_dive <- dive %>%
+  filter(deployid %in% deployids)
+
+```
+
+## Data Overview
+
+### Message Data
+This document is intended to provide an overview of the dive data available for the 2014-2016 Aleutian harbor seals. In all, 75 harbor seals were tagged. This summary will include an overview of dive data from all 75 seals and a more in-depth review of dive data from 5 seals.
+
+```{r deployids, echo = FALSE, fig.width = 12}
+ggplot2::ggplot(data = msg_tagtime, aes(x = deployid, y = (hrs_msg)/24)) +
+  geom_bar(stat = "identity", fill = "darkslategray4") +
+  geom_abline(intercept = 7, slope = 0, color = "darkorange2", size = 1) +
+  labs(title="Available Data (in days) for Each Tag Deployment", x ="DeployID", y = "Available Data (days)") + 
+  theme(axis.text.x = element_text(angle = 90))
+
+```
+
+Based on the availability of behavior message data, I removed all deployments from the data with less than 7 total days of data. This removed the following deployments:
+```{r deploy_overview, echo = FALSE}
+to_remove
+```
+
+The following figures display the time periods for which behavior log messages were available across each deployment for each year of the study by life history state of the tagged animal. Where there are gaps, there are no messages (or dive data) available.
+
+```{r msg_overview, echo = FALSE, fig.height = 7, fig.width = 12}
+ggplot2::ggplot(data = msg %>% filter(start_dt < '2015-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = life_history), size = 4) +
+  scale_colour_manual(values = c("Female: Adult" = "darkorange4", 
+                                 "Female: Subadult" = "darkorange2",
+                                 "Female: Young of year" = "darkgoldenrod1",
+                                 "Male: Adult" = "darkslategray",
+                                 "Male: Subadult" = "darkslategray4",
+                                 "Male: Young of year" = "darkslategray3")) +
+  labs(title="Messages from Tagged Harbor Seals: 2014", x ="Date", y = "DeployID")
+
+ggplot2::ggplot(data = msg %>% filter(start_dt < '2016-07-01' & start_dt > '2015-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = life_history), size = 4) +
+  scale_colour_manual(values = c("Female: Adult" = "darkorange4", 
+                                 "Female: Subadult" = "darkorange2",
+                                 "Female: Young of year" = "darkgoldenrod1",
+                                 "Male: Adult" = "darkslategray",
+                                 "Male: Subadult" = "darkslategray4",
+                                 "Male: Young of year" = "darkslategray3")) +
+  labs(title="Messages from Tagged Harbor Seals: 2015", x ="Date", y = "DeployID")
+
+ggplot2::ggplot(data = msg %>% filter(start_dt > '2016-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = life_history), size = 4) +
+  scale_colour_manual(values = c("Female: Adult" = "darkorange4", 
+                                 "Female: Subadult" = "darkorange2",
+                                 "Female: Young of year" = "darkgoldenrod1",
+                                 "Male: Adult" = "darkslategray",
+                                 "Male: Subadult" = "darkslategray4",
+                                 "Male: Young of year" = "darkslategray3")) +
+  labs(title="Messages from Tagged Harbor Seals: 2016", x ="Date", y = "DeployID")
+```
+
+The following figures show the time periods for which behavior log messages were available across each deployment for each year of the study by message type (dive or surface). Where there are gaps, there are no messages (or dive data) available.
+
+```{r dive2sfc, echo = FALSE, fig.height = 7, fig.width = 12}
+ggplot2::ggplot(data = dive2sfc %>% filter(start_dt < '2015-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = what), size = 4) +
+    scale_color_manual(values = c("Dive" = "darkslategray4", "Surface" = "darkslategray2")) +
+  labs(title="Messages from Tagged Harbor Seals: 2014", x ="Date", y = "DeployID")
+
+ggplot2::ggplot(data = dive2sfc %>% filter(start_dt < '2016-07-01' & start_dt > '2015-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = what), size = 4) +
+    scale_color_manual(values = c("Dive" = "darkslategray4", "Surface" = "darkslategray2")) +
+  labs(title="Messages from Tagged Harbor Seals: 2015", x ="Date", y = "DeployID")
+
+ggplot2::ggplot(data = dive2sfc %>% filter(start_dt > '2016-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = what), size = 4) +
+    scale_color_manual(values = c("Dive" = "darkslategray4", "Surface" = "darkslategray2")) +
+  labs(title="Messages from Tagged Harbor Seals: 2016", x ="Date", y = "DeployID")
+
+```
+
+### Dive Data 
+Dive type definitions:
+
+* Square = seal at the bottom for >50% of dive duration
+* U = seal at the bottom for >20% and <=50% of dive duration
+* V = seal at the bottom for <= 20% of dive duration
+
+Dive data were filtered to include dives where the max duration of dive was <60 minutes. This eliminated the following data:
+
+* In 2014, one 2-hour dive, one 3-hour dive and one 5-day dive
+* In 2015, one 2-hour dive, one 5-hour dive and one 5-day dive
+* In 2016, no dives
+
+The following figures show dives during each deployment by dive type for each year of the study to highlight the frequency of square-shaped dives and the occurrence of U- and V-shaped dived.
+
+```{r dive_overview, echo = FALSE, fig.height = 7, fig.width = 12}
+ggplot2::ggplot(data = dive %>% filter(start_dt < '2015-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = shape), size = 4) +
+  scale_color_manual(values = c("Square" = "darkslategray3", "U" = "darkorange2", "V" = "darkslategray")) +
+  labs(title="Dives from Tagged Harbor Seals: 2014", x ="Date", y = "DeployID")
+
+ggplot2::ggplot(data = dive %>% filter(start_dt < '2016-07-01' & start_dt > '2015-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = shape), size = 4) +
+  scale_color_manual(values = c("Square" = "darkslategray3", "U" = "darkorange2", "V" = "darkslategray")) +
+  labs(title="Dives from Tagged Harbor Seals: 2015", x ="Date", y = "DeployID")
+
+ggplot2::ggplot(data = dive %>% filter(start_dt > '2016-07-01')) +
+  geom_segment(aes(x=as.POSIXct(as.character(start_dt)), xend=as.POSIXct(as.character(end_dt)),
+                   y=deployid, yend=deployid, color = shape), size = 4) +
+  scale_color_manual(values = c("Square" = "darkslategray3", "U" = "darkorange2", "V" = "darkslategray")) +
+  labs(title="Dives from Tagged Harbor Seals: 2016", x ="Date", y = "DeployID")
+```
+
+The following figure shows the number of dives per hour binned by the number of minutes per hour with dive data available. The data were binned for grouping along the x-axis using the following bins: 0-9 minutes, 10-19 minutes, 20-29 minutes, 30-39 minutes, 40-49 minutes, 50-59 minutes, and 60 minutes. The average number of dives was dramatically lower for the 60-minute bin when all data were included, because there are a lot of full hours when the seal is hauled out and in turn, there are zero dives. Figures show the summary information for each bin both including and excluding full hours where the number of dives was zero.
+
+```{r dive_per_hour, echo = FALSE, fig.height = 4}
+ggplot2::ggplot(data = all_times) +
+  geom_boxplot(aes(x = min_bin, y = dives_per_hour, group = min_bin) , color = "darkslategray4") +
+  labs(title="Number of Dives per Hour (including hours with zero dives)", x ="10-minute bin", y = "Number of Dives per Hour")
+
+ggplot2::ggplot(data = all_times %>% filter(dives_per_hour > 0)) +
+  geom_boxplot(aes(x = min_bin, y = dives_per_hour, group = min_bin) , color = "darkslategray4") +
+  labs(title="Number of Dives per Hour (excluding hours with zero dives)", x ="10-minute bin", y = "Number of Dives per Hour")
+```
+
+## Subset Overview
+Five harbor seals were selected for a more in-depth revew of dive data: 
+
+* PV2014_2016_10A0586: Subadult Male, Longest tag duration from 2014, also did a big trip off-shelf from Adak
+* PV2015_1008_14A0822: Subadult Female, Made 2 long trips into Bristol Bay
+* PV2015_1016_14A0808: Adult Male, Made several trips between two different foraging areas in eastern Aleutians
+* PV2016_3001_16A0227: Adult Female, Longest tag duration from 2016, stayed close to Adak
+* PV2016_3021_15A0891: Subadult Female, Longest movement track from 2016, stayed within Near Islands
+
+### Message and Dive Data for Individual Seals
+Message and dive data were processed as follows:
+
+* A dataset was created for each hour between first and last message received for each seal.
+* The number of minutes messages covered within each hour were calculated for the duration of the tag deployment.
+* Dive data were filtered to include dives where the max duration of dive was <60 minutes. No dives were removed for the target seals, but several were removed (detailed above) for the full seal dataset.
+* The number of dives of each type (Square, U, and V) were calculated for each seal by hour and joined to the dataset covering the full tag deployment for each seal.
+* The maximum depth and maximum dive duration were identified for each seal by hour and joined to the dataset covering the full tag deployment for each seal.
+
+The following figure displays an overiew of the data available from each of the seals selected. The color of the bar represents the life history state for each seal. The shading of the bar for each seal represents the minutes of data available for each hour the tag was deployed. As you will see in later figures, most hours either have all or none of the data available, so the intermediate bars are kind of hard to detect.
+
+```{r sub_seals, echo = FALSE, fig.height = 6, fig.width = 10}
+ggplot2::ggplot(data = sub_times) +
+  geom_segment(aes(x=as.POSIXct(as.character(start)), xend=as.POSIXct(as.character(end)),
+                     y=deployid, yend=deployid, color = life_history, alpha = min_per_hour), size = 10) +
+  scale_colour_manual(values = c("Female: Adult" = "darkorange4", 
+                                 "Female: Subadult" = "darkorange2",
+                                 "Female: Young of year" = "darkgoldenrod1",
+                                 "Male: Adult" = "darkslategray",
+                                 "Male: Subadult" = "darkslategray4",
+                                 "Male: Young of year" = "darkslategray3")) +
+  labs(title="Messages from Tagged Harbor Seals", x ="Date", y = "DeployID")
+```
+
+The following figure summarizes the number of minutes per hour the messages cover from each tagged seal.
+
+```{r process_msg_subTimes, echo = FALSE, fig.width = 10}
+ggplot2::ggplot(sub_times) + 
+  geom_histogram(aes(x = min_per_hour), binwidth = 1, fill = "darkslategray4") +
+  facet_grid(cols = vars(deployid)) +
+  labs(title="Number of Minutes per Hour with Messages", x ="Number of Minutes", y = "Count")
+```
+
+And to focus in on the number of minutes per hour the messages cover from each tagged seal, excluding 0 and 60.
+
+``` {r process_msg_1t59, echo = FALSE, fig.width = 10}
+ggplot2::ggplot(data = sub_times %>% filter(min_per_hour > 0 & min_per_hour < 60)) + 
+  geom_histogram(aes(x = min_per_hour), binwidth = 1, fill = "darkslategray4") +
+  facet_grid(cols = vars(deployid)) +
+  labs(title="Number of Minutes per Hour with Messages", x ="Number of Minutes", y = "Count")
+```
+
+The following figure displays the maximum dive duration relative to the maximum dive depth, symbolized by dive type (shape)...first for all deployments, then for subset of 5 tags. A linear model was fit to each dive type to help distinguish any patterns in the duration and depth by dive type.
+
+```{r duration_by_depth, echo = FALSE, warning = FALSE, fig.width = 10}
+ggplot2::ggplot(dive, aes(x = duration_max/60, y = depth_max, color = shape)) +
+  geom_point(size = 0.9) +
+  geom_smooth(method = "lm", fill = NA) +
+  scale_color_manual(values = c("Square" = "darkslategray3", "U" = "darkorange2", "V" = "darkslategray")) +
+  labs(title="Maximum Dive Duration by Maximum Dive Depth for All Deployments", x ="Maximum Dive Duration (minutes)", y = "Maximum Dive Depth (m)")
+
+ggplot2::ggplot(sub_dive, aes(x = duration_max/60, y = depth_max, color = shape)) +
+  geom_point(size = 0.9) +
+  geom_smooth(method = "lm", fill = NA) +
+  facet_grid(rows = vars(substring(deployid, 1, 11))) +
+  scale_color_manual(values = c("Square" = "darkslategray3", "U" = "darkorange2", "V" = "darkslategray")) +
+  labs(title="Maximum Dive Duration by Maximum Dive Depth by DeployID", x ="Maximum Dive Duration (minutes)", y = "Maximum Dive Depth (m)")
+```
+
+The following figure displays the maximum dive duration by hour...first for all deployments, then for subset of 5 tags.
+
+```{r duration_by_hour, echo = FALSE, warning = FALSE, fig.width = 10}
+ggplot2::ggplot(all_times, aes(x = hour, y = duration_max/60)) +
+  geom_boxplot(aes(group = hour) , color = "darkslategray4") +
+  labs(title="Maximum Dive Duration by Hour for All Deployments", x ="Hour", y = "Maximum Dive Duration (minutes)")
+
+ggplot2::ggplot(sub_times, aes(x = hour, y = duration_max/60)) +
+  geom_boxplot(aes(group = hour) , color = "darkslategray4") +
+  facet_grid(rows = vars(substring(deployid, 1, 11))) +
+  labs(title="Maximum Dive Duration by Hour by DeployID", x ="Hour", y = "Maximum Dive Duration (minutes)")
+```
+
+The following figure displays the maximum dive depth by hour...first for all deployments, then for subset of 5 tags. 
+
+```{r depth_by_hour, echo = FALSE, warning = FALSE, fig.width = 10}
+ggplot2::ggplot(all_times, aes(x = hour, y = depth_max)) +
+  geom_boxplot(aes(group = hour) , color = "darkslategray4") +
+  labs(title="Maximum Dive Depth by Hour for All Deployments", x ="Hour", y = "Maximum Dive Depth (m)")
+
+ggplot2::ggplot(sub_times, aes(x = hour, y = depth_max)) +
+  geom_boxplot(aes(group = hour) , color = "darkslategray4") +
+  facet_grid(rows = vars(substring(deployid, 1, 11))) +
+  labs(title="Maximum Dive Depth by Hour by DeployID", x ="Hour", y = "Maximum Dive Depth (m)")
+```
+
+The following figure displays the number of square-shaped dives by hour...first for all deployments, then for subset of 5 tags. 
+
+```{r square_by_hour, echo = FALSE, warning = FALSE, fig.width = 10}
+ggplot2::ggplot(all_times, aes(x = hour)) +
+  geom_boxplot(aes(group = hour, y = Square), color = "darkslategray4") +
+  labs(title="Count of Square-shaped Dives by Hour for All Deployments", x ="Hour", y = "Count")
+
+ggplot2::ggplot(sub_times, aes(x = hour)) +
+  geom_boxplot(aes(group = hour, y = Square), color = "darkslategray4") +
+  facet_grid(rows = vars(substring(deployid, 1, 11))) +
+  labs(title="Count of Square-shaped Dives by Hour by DeployID", x ="Hour", y = "Count")
+```
+
+The following figure displays the number of U-shaped dives by hour...first for all deployments, then for subset of 5 tags. 
+
+```{r u_by_hour, echo = FALSE, warning = FALSE, fig.width = 10}
+ggplot2::ggplot(all_times, aes(x = hour)) +
+  geom_boxplot(aes(group = hour, y = U), color = "darkorange2") +
+  labs(title="Count of U-shaped Dives by Hour for All Deployments", x ="Hour", y = "Count")
+
+ggplot2::ggplot(sub_times, aes(x = hour)) +
+  geom_boxplot(aes(group = hour, y = U), color = "darkorange2") +
+  facet_grid(rows = vars(substring(deployid, 1, 11))) +
+  labs(title="Count of U-shaped Dives by Hour by DeployID", x ="Hour", y = "Count")
+```
+
+The following figure displays the number of V-shaped dives by hour...first for all deployments, then for subset of 5 tags. 
+
+```{r v_by_hour, echo = FALSE, warning = FALSE, fig.width = 10}
+ggplot2::ggplot(all_times, aes(x = hour)) +
+  geom_boxplot(aes(group = hour, y = V), color = "darkslategray") +
+  labs(title="Count of V-shaped Dives by Hour for All Deployments", x ="Hour", y = "Count")
+
+ggplot2::ggplot(sub_times, aes(x = hour)) +
+  geom_boxplot(aes(group = hour, y = V), color = "darkslategray") +
+  facet_grid(rows = vars(substring(deployid, 1, 11))) +
+  labs(title="Count of V-shaped Dives by Hour by DeployID", x ="Hour", y = "Count")
+```
