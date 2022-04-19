@@ -1,0 +1,56 @@
+---
+title: 'Disenchantment Bay Tagging: Data Review'
+author: "Stacie Hardy"
+date: "4/18/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(stringr)
+library(lubridate)
+library(RPostgreSQL)
+library(ggplot2)
+library(reshape2)
+
+# Connect to DB and get starting data
+con <- RPostgreSQL::dbConnect(PostgreSQL(), 
+                              dbname = Sys.getenv("pep_db"), 
+                              host = Sys.getenv("pep_ip"), 
+                              port = Sys.getenv("pep_port"),
+                              user = Sys.getenv("pep_user"), 
+                              password = "$e@l")
+
+haulout <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM telem.tbl_wc_haulout WHERE deployid LIKE \'PV2016%\'")
+
+
+ggplot(haulout_2016_m, aes(value, deployid)) +
+  geom_line(size=4) +
+  xlab(NULL) +
+  ylab(NULL) +
+  ggtitle("Haulout by Seal") +
+  theme_minimal() +
+  theme(aspect.ratio = 0.4, axis.text = element_text(size = 7))
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
