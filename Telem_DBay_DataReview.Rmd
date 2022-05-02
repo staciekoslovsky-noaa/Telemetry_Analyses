@@ -5,8 +5,8 @@ date: "4/18/2022"
 output: pdf_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 
 library(tidyverse)
 library(stringr)
@@ -14,6 +14,7 @@ library(lubridate)
 library(RPostgreSQL)
 library(ggplot2)
 library(reshape2)
+library(scales)
 
 # Connect to DB and get starting data
 con <- RPostgreSQL::dbConnect(PostgreSQL(), 
@@ -23,34 +24,46 @@ con <- RPostgreSQL::dbConnect(PostgreSQL(),
                               user = Sys.getenv("pep_user"), 
                               password = "$e@l")
 
-haulout <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM telem.tbl_wc_haulout WHERE deployid LIKE \'PV2016%\'")
+haulout <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM telem.tbl_wc_haulout WHERE deployid LIKE \'PV2016%\'") 
 
+haulout <- haulout %>%
+  select(deployid, haulout_start_dt, haulout_end_dt) %>%
+  filter(!is.na(haulout_end_dt)) %>%
+  mutate(haulout_start_dt = as.POSIXct(haulout_start_dt, origin = as.Date("1970-01-01"), tz = "GMT")) %>%
+  mutate(haulout_end_dt = as.POSIXct(haulout_end_dt, origin = as.Date("1970-01-01"), tz = "GMT"))
 
-ggplot(haulout_2016_m, aes(value, deployid)) +
-  geom_line(size=4) +
-  xlab(NULL) +
-  ylab(NULL) +
-  ggtitle("Haulout by Seal") +
-  theme_minimal() +
-  theme(aspect.ratio = 0.4, axis.text = element_text(size = 7))
+haulout_m <- melt(haulout, id.vars = "deployid") %>%
+  mutate(value = as.POSIXct(value, origin = as.Date("1970-01-01"), tz = "GMT")) %>%
+  arrange(deployid, value) 
+haulout_m$eventID <- rep(seq(1, nrow(haulout_m)/2, 1), each=2)
+
+# NEED TO ADD ROWS WHERE START/END TIMES COVER DAY CHANGE...do this by creating rows for all hours between start and end of a deployment
+
+deployids <- unique(haulout$deployid)
 ```
 
-## R Markdown
+```{r figures, results = 'all'}
+# Figure 1
+lims <- c(as.POSIXct("2021-01-01 00:00:00", origin = as.Date("1970-01-01"), tz = "GMT"), as.POSIXct("2021-01-02 00:00:00", origin = as.Date("1970-01-01"), tz = "GMT"))
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+for (i in 1:length(deployids)) {
+  haulout_m2 <- haulout_m %>%
+    filter(deployid == deployids[i]) %>%
+    mutate(time = as.POSIXct(paste('2021-01-01', strftime(value, format = "%H:%M:%S")), tz = "GMT"),
+         date = as_date(value)) %>%
+    mutate(end_time = lead(time, 1)) %>%
+    mutate(time = as.POSIXct(ifelse(end_time < time & variable == "haulout_start_dt", time - 3600 * 24, time), origin = as.Date("1970-01-01"), tz = "GMT"))
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+p <- ggplot(haulout_m2) +
+  geom_line(aes(time, date, group = eventID, color = deployid), size = 1.5) +
+  #coord_polar(start = 0, direction = 1) +
+  scale_x_datetime(limits = lims, breaks = date_breaks("2 hour"), date_labels = "%H:%M:%S") +
+  ylim(min(haulout_m2$date) - 1, max(haulout_m2$date)) +
+  xlab('Time of Day') +
+  ylab('Date') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 
-```{r cars}
-summary(cars)
+print(p)
+}
+
 ```
-
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
