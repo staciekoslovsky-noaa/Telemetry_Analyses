@@ -1,9 +1,15 @@
 ---
-title: 'Disenchantment Bay Tagging: Data Review'
+title: 'Disenchantment Bay Tagging: A Visual Review of Haulout Bouts'
 author: "Stacie Hardy"
-date: "4/18/2022"
+date: "5/5/2022"
 output: pdf_document
 ---
+
+## Introduction
+The figures in this document represent the haulout periods recorded by each tag deployed on harbor seals in Disenchantment Bay, AK in 2016 and 2017. For this first round of review, the only QA/QC that was applied to these data was to remove any haulout periods where the start time or end time was missing (NA). This first round of figures was created to review the data for visual inspection of the data to identify any gross outliers or issues in the data. 
+
+## Figures by deployid
+NOTE: The x-axis represents the data over a 24-hour time period, starting with 00:00:00 GMT; the time labels are displayed as the times in local Alaska Daylight Savings Time for ease of interpretation.
 
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
@@ -15,6 +21,7 @@ library(RPostgreSQL)
 library(ggplot2)
 library(reshape2)
 library(scales)
+library(solartime)
 
 # Connect to DB and get starting data
 con <- RPostgreSQL::dbConnect(PostgreSQL(), 
@@ -24,7 +31,7 @@ con <- RPostgreSQL::dbConnect(PostgreSQL(),
                               user = Sys.getenv("pep_user"), 
                               password = "$e@l")
 
-haulout <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM telem.tbl_wc_haulout WHERE deployid LIKE \'PV2016%\'") 
+haulout <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM telem.tbl_wc_haulout WHERE deployid LIKE \'PV2016%\' OR deployid LIKE \'PV2017%\'") 
 
 haulout <- haulout %>%
   select(deployid, haulout_start_dt, haulout_end_dt) %>%
@@ -32,19 +39,31 @@ haulout <- haulout %>%
   mutate(haulout_start_dt = as.POSIXct(haulout_start_dt, origin = as.Date("1970-01-01"), tz = "GMT")) %>%
   mutate(haulout_end_dt = as.POSIXct(haulout_end_dt, origin = as.Date("1970-01-01"), tz = "GMT"))
 
-haulout_m <- melt(haulout, id.vars = "deployid") %>%
+haulout_firstDay <- haulout %>%
+  filter(as.Date(haulout_start_dt, tz = "GMT") != as.Date(haulout_end_dt, tz = "GMT")) %>%
+  mutate(haulout_end_dt = as.POSIXct(paste(as.Date(haulout_start_dt, tz = "GMT"), "23:59:59", sep = " "), origin = as.Date("1970-01-01"), tz = "GMT"))
+
+haulout_nextDay <- haulout %>%
+  filter(as.Date(haulout_start_dt, tz = "GMT") != as.Date(haulout_end_dt, tz = "GMT")) %>%
+  mutate(haulout_start_dt = as.POSIXct(paste(as.Date(haulout_end_dt, tz = "GMT"), "00:00:00", sep = " "), origin = as.Date("1970-01-01"), tz = "GMT"))
+
+haulout_new <- haulout %>%
+  filter(as.Date(haulout_start_dt, tz = "GMT") == as.Date(haulout_end_dt, tz = "GMT")) %>%
+  rbind(haulout_firstDay) %>%
+  rbind(haulout_nextDay)
+rm(haulout_firstDay, haulout_nextDay)
+
+haulout_m <- melt(haulout_new, id.vars = "deployid") %>%
   mutate(value = as.POSIXct(value, origin = as.Date("1970-01-01"), tz = "GMT")) %>%
   arrange(deployid, value) 
 haulout_m$eventID <- rep(seq(1, nrow(haulout_m)/2, 1), each=2)
 
-# NEED TO ADD ROWS WHERE START/END TIMES COVER DAY CHANGE...do this by creating rows for all hours between start and end of a deployment
-
-deployids <- unique(haulout$deployid)
+deployids <- unique(haulout_m$deployid)
 ```
 
 ```{r figures, results = 'all'}
 # Figure 1
-lims <- c(as.POSIXct("2021-01-01 00:00:00", origin = as.Date("1970-01-01"), tz = "GMT"), as.POSIXct("2021-01-02 00:00:00", origin = as.Date("1970-01-01"), tz = "GMT"))
+x_lims <- c(as.POSIXct("2021-01-01 00:00:00", origin = as.Date("1970-01-01"), tz = "GMT"), as.POSIXct("2021-01-02 00:00:00", origin = as.Date("1970-01-01"), tz = "GMT"))
 
 for (i in 1:length(deployids)) {
   haulout_m2 <- haulout_m %>%
@@ -53,17 +72,38 @@ for (i in 1:length(deployids)) {
          date = as_date(value)) %>%
     mutate(end_time = lead(time, 1)) %>%
     mutate(time = as.POSIXct(ifelse(end_time < time & variable == "haulout_start_dt", time - 3600 * 24, time), origin = as.Date("1970-01-01"), tz = "GMT"))
+  
+    y_lims <-c(as.POSIXct(min(haulout_m2$date) - 1, origin = as.Date("1970-01-01"), tz = "GMT"), 
+             as.POSIXct(max(haulout_m2$date), origin = as.Date("1970-01-01"), tz = "GMT"))
+  
+  # timestamp <- seq(round(min(haulout_m2$value), units = "hours"), min(haulout_m2$value) + 3600 * 24, by = "60 min")
+  # daytime <- computeIsDayByLocation(timestamp, latDeg = 60.013971, longDeg =  -139.540203, timeZone = 0)
+  # 
+  # daylight <- as.data.frame(cbind(timestamp, daytime))  %>%
+  #   mutate(timestamp = as.POSIXct(timestamp, origin = as.Date("1970-01-01"), tz = "GMT")) %>%
+  #   mutate(time = as.POSIXct(paste('2021-01-01', strftime(timestamp, format = "%H:%M:%S")), tz = "GMT")) %>%
+  #   full_join(haulout_m2$date, by = character(), copy = TRUE) %>%
+  #   filter(daytime == 1)
 
-p <- ggplot(haulout_m2) +
-  geom_line(aes(time, date, group = eventID, color = deployid), size = 1.5) +
-  #coord_polar(start = 0, direction = 1) +
-  scale_x_datetime(limits = lims, breaks = date_breaks("2 hour"), date_labels = "%H:%M:%S") +
-  ylim(min(haulout_m2$date) - 1, max(haulout_m2$date)) +
-  xlab('Time of Day') +
-  ylab('Date') +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  rm(timestamp, daytime)
+  
+  p <- ggplot(data = haulout_m2) +
+    #geom_line(data = daylight %>% filter(daytime == 1), aes(x = time, y = y), color = "yellow", size = 10, alpha = 0.5) +
+    #geom_line(data = daylight %>% filter(daytime == 0), aes(x = time, y = y), color = "darkblue", size = 10, alpha = 0.5) +
+    #geom_rect(data = daylight, aes(xmin = min(daylight$time), xmax =  max(daylight$time), ymin = min(daylight$y)), ymax = max(daylight$y)) +
+    geom_line(aes(x= time, y = date, group = eventID, color = deployid), size = 1.5) +
+    #coord_polar(start = 0, direction = 1) +
+    scale_x_datetime(limits = x_lims, breaks = date_breaks("1 hour"), labels = date_format("%H:%M", tz = "America/Anchorage")) + 
+    scale_y_date(date_breaks = "1 day") +
+    #ylim(min(haulout_m2$date) - 1, max(haulout_m2$date)) +
+    xlab('Time of Day (AKDT)') +
+    ylab('Date') +
+    ggtitle(paste("Haulout Bouts for ", deployids[i], sep = "")) +
+    theme(panel.grid.minor = element_blank() ,
+          legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 
-print(p)
+print(p)  
 }
 
 ```
