@@ -29,7 +29,7 @@ con <- RPostgreSQL::dbConnect(PostgreSQL(),
                               host = Sys.getenv("pep_ip"), 
                               port = Sys.getenv("pep_port"),
                               user = Sys.getenv("pep_user"), 
-                              password = "$e@l")
+                              password = "user_pw")
 
 haulout <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM telem.tbl_wc_haulout WHERE deployid LIKE \'PV2016%\' OR deployid LIKE \'PV2017%\'") 
 
